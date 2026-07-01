@@ -2,7 +2,7 @@
   "name": "heap-analyzer",
   "version": "1.0.0",
   "private": true,
-  "description": "Static V8 heap snapshot/timeline analyzer built on memlab. Adds framework semantics, leak-mechanism hints, and snapshot×timeline correlation on top of memlab's dominator/retainer analysis.",
+  "description": "Static V8 heap snapshot/timeline analyzer built on memlab. Reports raw growing objects, retainer paths, dominator paths, and timeline stack candidates without business translation rules.",
   "type": "commonjs",
   "engines": { "node": ">=18" },
   "scripts": {

@@ -1,208 +1,280 @@
-# V8 Heap/TIMELINE 内存泄露分析器
+# SnapshotMemDetector
 
-这是一个基于 **memlab** 的静态分析工具。它面向前端项目的 `.heapsnapshot` / `.heapdump` / `.heaptimeline` 文件，不启动浏览器，不抓取页面，直接从已有文件里生成业务可读的内存泄露报告。
+SnapshotMemDetector 是一个基于 **memlab** 的 V8 heap snapshot / heaptimeline 静态分析器。当前版本不做业务翻译，不要求维护 `config.js`，只输出最原始、最通用的证据：
 
-项目现在刻意保持很小：核心代码只在一份文件里。
+- 哪些真实 V8 对象持续增长；
+- 这些对象之间如何互相持有；
+- 对象为什么还活着，也就是 retainer / dominator 证据；
+- 能回到代码的连续调用栈，优先用对象级 `trace_node_id`，没有时用同次 timeline 的高分配候选栈。
+
+## 目录结构
 
 ```text
+heapdump/
+  before.heapsnapshot
+  after.heapsnapshot
+  run.heaptimeline
+
 analysis/
-  analyze.js        # CLI 入口，只负责解析参数、运行、写 reports/*.json
-  config.js         # 业务配置，通常唯一需要改的文件
-  lib/analyzer.js   # 全部分析逻辑：增长检测、关系链、框架/业务识别、timeline 栈解析、报告格式
+  analyze.js
+  AI_PROMPT.md
+  lib/raw-analyzer.js
+  reports/
 ```
 
-## 安装
+所有待分析文件都放在仓库根目录的 `heapdump/` 下。`heapdump/` 已在 `.gitignore` 中，不会提交大文件。
 
-Node >= 18。
+## 运行
 
 ```powershell
 cd analysis
 npm install
+npm run analyze
 ```
 
-依赖只有 `@memlab/api`。本项目复用 memlab 的静态 heap graph 能力，不使用浏览器自动化。
+默认会读取 `../heapdump/`：
 
-## 怎么跑
+- `.heapsnapshot` / `.heapdump`：按文件名排序，作为多份 heap 样本。
+- `.heaptimeline`：默认取目录中最后一份 timeline。
 
-推荐给 2 份以上 snapshot；2 份只能证明“从 A 到 B 变大”，5 份以上更适合判断趋势。
+也可以显式指定目录：
 
 ```powershell
-# 多份 snapshot 直接传入，最后一份作为 final heap 做关系链分析
-node --max-old-space-size=12288 analyze.js before.heapsnapshot after.heapsnapshot run.heaptimeline
-
-# 或者把多份 snapshot/heapdump 放一个目录，文件名排序就是时间顺序
-node --max-old-space-size=12288 analyze.js --dir D:\Code\Snapshot D:\Code\Snapshot\Heap-20260702T020808.heaptimeline
+node --max-old-space-size=12288 analyze.js --dir D:\Code\Snapshot\heapdump
 ```
 
-`--max-old-space-size=12288` 建议保留。memlab 加载大型 snapshot 并计算 dominator tree 时峰值内存会比较高。
+建议保留 `--max-old-space-size=12288`。大型 heap 加载和 dominator tree 计算会占用较多内存。
 
-## 核心逻辑
+## 输出
 
-1. **输入多份 heap 文件**
-   - 支持 `.heapsnapshot` 和 `.heapdump`。
-   - 如果使用 `--dir`，按文件名排序作为时间线。
-   - 最后一份 heap 是 `finalSnapshot`，用于对象关系、DOM、global、字符串等证据分析。
-
-2. **找持续增长对象**
-   - 对每个 snapshot 调用 memlab 的 `getFullHeapFromFile`。
-   - 按 V8 node id 追踪 `object` / `closure` / `regexp` / `native` / `array`。
-   - 只保留每一份 snapshot 都存在、类型和名字一致、`retainedSize` 单调不下降、最终 delta 大于 `config.unboundGrowth.thresholdBytes` 的对象。
-   - 输出按 `delta` 从大到小排序。
-
-3. **用 memlab 做对象关系**
-   - 对每个增长对象，在 final heap 上提取：
-     - `dominatorNode` 链：谁在主持有这个对象。
-     - `referrers`：哪些边在引用它，边名常对应业务变量名。
-     - `retainedSize` / `self_size`：对象自身与独占保留大小。
-     - `getReferenceNode`：通过稳定属性边识别 Vue/React/自研框架实例。
-   - 额外用 memlab 的 `utils.isDetachedDOMNode` 和 `PluginUtils.filterOutLargestObjects` 输出 detached DOM 证据。
-
-4. **去 timeline 里找堆栈结构**
-   - 解析 `.heaptimeline` 的 `trace_function_infos` 和递归 `trace_tree`。
-   - 输出 allocation 热点函数：`functionName`、`scriptUrl`、`line`、`column`、`allocationSize`、`allocationCount`、`sampleStack`。
-   - 如果 heap node 自身带 `trace_node_id`，报告会给对象级精确栈。
-   - 如果普通 `.heapsnapshot` 没有 `trace_node_id`，工具不会假装精确；增长对象里会写明原因，并把 `timeline.functions` 作为业务函数候选热点。
-
-## 报告输出
-
-运行后会同时打印控制台摘要，并写入：
+每次运行会在 `analysis/reports/` 生成两份文件：
 
 ```text
-analysis/reports/report-<timestamp>.json
+report-<timestamp>-human.md   # 给人看的原始对象报告
+report-<timestamp>-ai.json    # 完整结构化证据
 ```
 
-报告结构：
+把 AI JSON 丢给 AI 继续诊断时，直接使用固定提示词：`analysis/AI_PROMPT.md`。这个文件不会在每次运行时重新生成。
+
+命令行也会打印摘要，格式类似：
+
+```text
+========== 原始对象内存报告 ==========
+持续增长对象: 588（报告展示 80）
+对象簇: 8
+
+-- 需要优先排查的真实对象 --
+
+排查: 优先检查这条持有链里的 Map/Set/Array 缓冲，确认业务结束后 delete/clear。
+对象链: Context --dn--> closure/e --buf--> Map --table--> Array
+大小: +321.3 KB，最大保留 207.1 KB，对象 id: ...
+持有路径: previous <- Context <- context <- closure
+代码栈: 候选调用栈，4.82 MB / 239116 次分配
+```
+
+## 整体原理
+
+```text
+heapdump files
+  -> memlab heap graph
+  -> sustained growth scan
+  -> raw retainer/dominator evidence
+  -> related-object clustering
+  -> timeline stack attribution
+  -> human report + AI JSON
+```
+
+### 1. memlab 解析 heap
+
+核心入口是：
+
+```js
+getFullHeapFromFile(file)
+```
+
+memlab 返回 `IHeapSnapshot`，里面已经包含：
+
+| memlab 产物 | 含义 | 本项目用途 |
+|---|---|---|
+| `heap.nodes` | V8 heap 全部节点 | 遍历对象，做增长追踪 |
+| `node.id` | V8 节点 id | 多份 snapshot 之间追踪同一个对象 |
+| `node.type` | 节点类型，如 `object`、`closure`、`native` | 过滤可能持有业务状态的节点 |
+| `node.name` | 构造器名、函数名、DOM 描述、V8 内部名 | 展示真实对象身份 |
+| `node.self_size` | 节点自身大小 | 辅助信息 |
+| `node.retainedSize` | 对象独占保留大小 | 判断增长和排序的核心指标 |
+| `node.dominatorNode` | dominator tree 父节点 | 构造主持有链 |
+| `node.references` | 当前节点指向哪些节点 | 后续扩展用 |
+| `node.referrers` | 哪些节点指向当前节点 | 找直接持有者和属性边 |
+| `node.trace_node_id` | timeline 分配栈 id | 有值时可映射到对象级精确栈 |
+| `utils.isDetachedDOMNode` | memlab detached DOM 判定 | 输出 DOM 泄漏辅助证据 |
+| `PluginUtils.filterOutLargestObjects` | 按 retainedSize 取 Top N | 找最大 detached DOM / holder |
+
+最重要的是 `retainedSize`。它表示“如果释放这个对象，它独占控制的对象图大约能释放多少”，比 `self_size` 更适合判断泄漏影响。
+
+### 2. 找持续增长对象
+
+工具按 V8 node id 追踪对象，只保留：
+
+- 在每份 snapshot 中都存在；
+- `type` 和 `name` 没变；
+- `retainedSize` 单调不下降；
+- 增长量超过阈值，默认 `1024 B`。
+
+被追踪的类型：
+
+```js
+object, closure, regexp, native, array
+```
+
+这些类型最容易代表 JS 状态、闭包上下文、DOM/native 对象和容器结构。
+
+### 3. 合并相关对象
+
+单个泄漏通常不是一个对象，而是一串对象链。例如：
+
+```text
+system / Context / scope @1750315 --dn--> closure/e --buf--> Map --table--> Array
+```
+
+这说明：
+
+- 一个闭包上下文保留了 `closure/e`；
+- `closure/e` 通过 `buf` 属性持有 `Map`；
+- `Map` 通过 `table` 持有底层数组；
+- 这几个对象一起增长，应该作为一个排查点看。
+
+工具会用增长对象之间的直接 referrer 边、retaining path、dominator path 做 union，把互相持有或相邻的增长对象合并成“对象簇”。人类报告优先展示对象簇，而不是展示一堆重复对象。
+
+### 4. 提取持有证据
+
+每个增长对象会记录：
+
+- `dominatorPath`：主持有路径，回答“谁主导保留它”；
+- `referrers`：直接引用它的对象和属性边；
+- `retainingPaths`：从对象向外走 referrer 得到的可读持有路径；
+- `exactStack`：如果对象有 `trace_node_id`，映射到 timeline 中的精确对象栈。
+
+报告里的“持有路径”来自 `referrers`，例如：
+
+```text
+previous <- object/system / Context / scope @1785313 <- context <- closure/(anonymous)
+```
+
+这比业务翻译更底层，也更通用：即使代码去符号，属性边和 V8 对象关系仍然可用。
+
+### 5. 映射到代码栈
+
+`.heaptimeline` 里有两类关键数据：
+
+- `trace_function_infos`：函数名、脚本 URL、行、列；
+- `trace_tree`：递归 allocation 调用树，每个节点有 `count` 和 `size`。
+
+工具会把 `trace_tree` 展成连续调用栈：
+
+```text
+run (...index.js:13:1473)
+  -> (anonymous) (...index.js:13:9357)
+    -> $g (...index.js:30:117947)
+      -> t (...index.js:30:115492)
+        -> value (...index.js:30:110855)
+```
+
+栈分两种置信度：
+
+- **精确对象栈**：heap node 有 `trace_node_id`，并且能在 timeline 的 `trace_tree` 里找到；
+- **候选调用栈**：普通 snapshot 没有对象级 `trace_node_id`，只能展示同次 timeline 中分配最多的连续栈，作为回源码的候选位置。
+
+如果代码被压缩或去符号，函数名可能只是 `t`、`e`、`value`。此时最可靠的定位锚点是：
+
+```text
+scriptUrl:line:column
+```
+
+后续需要配合 sourcemap 回到源码。
+
+## AI JSON 结构
+
+`report-*-ai.json` 保留完整原始证据：
 
 ```js
 {
-  generatedAt,
   inputs: {
-    snapshots,       // 输入 heap 文件列表
-    finalSnapshot,   // 用于关系链分析的最后一份 heap
+    heapdumpDir,
+    snapshots,
+    finalSnapshot,
     timeline,
   },
-  memlabCapabilities, // 本次复用的 memlab 能力清单
   summary: {
     snapshotCount,
     sustainedGrowthCount,
-    finalHeapNodes,
-    timelineTraceFunctions,
+    reportedGrowthCount,
+    objectClusterCount,
     timelineTraceTreeNodes,
-    exactObjectAllocationStacks,
-    notes,
+    exactObjectStacks,
   },
-  growth: {
-    findings: [
-      {
-        id,
-        type,
-        name,
-        initialSize,
-        finalSize,
-        delta,
-        history,
-        relationship: {
-          business,        // DOM class / 框架实例 / retainer edge 推断出的业务归属
-          frameworkOwner,  // Vue/React/自研框架实例
-          likelyCause,     // observer/event/global property 等泄漏机制提示
-          allocation,      // 对象级栈，或说明为什么只能看 timeline 热点
-          dominatorChain,
-          referrers,
-        },
-      }
-    ]
-  },
+  objectClusters: [{
+    title,
+    chain,
+    objectIds,
+    totalDelta,
+    maxFinalSize,
+    objects,
+    retainingPaths,
+    recommendation,
+    stack,
+  }],
+  growthFindings: [{
+    id,
+    type,
+    name,
+    initialSize,
+    finalSize,
+    delta,
+    history,
+    relationship: {
+      rawObject,
+      dominatorPath,
+      referrers,
+      retainingPaths,
+      exactStack,
+    }
+  }],
   timeline: {
-    functions, // allocation 热点函数，按 allocationSize 排序
-    scripts,
+    topStacks,
+    topFunctions,
+    topScripts,
   },
   heapEvidence: {
     detachedDom,
     topHolders,
-    globalVariables,
-    duplicateStrings,
   }
 }
 ```
 
-最终你主要看两块：
+最常看的字段：
 
-- `growth.findings`：真正跨 snapshot 持续增长的对象，以及它们的持有链、业务归属、可能泄漏机制。
-- `timeline.functions`：本次录制期间分配最多的业务函数/脚本。若增长对象没有 `trace_node_id`，这里是定位业务处理函数的候选入口。
+- `objectClusters`：人类报告的核心，已经把相关增长对象合并；
+- `growthFindings`：单个对象的完整证据；
+- `relationship.referrers`：谁直接持有这个对象；
+- `relationship.retainingPaths`：对象为什么还活着；
+- `stack.frames`：连续调用栈和代码位置。
 
-## 配置
+## 为什么不再需要 config.js
 
-只改 `config.js`。
+旧版本尝试用 DOM class、框架规则、业务脚本白名单把 V8 对象翻译成业务模块。这个思路在有清晰业务命名时有用，但在生产环境、去符号代码、混淆函数名下会引入误导：报告看起来像业务结论，其实只是启发式猜测。
 
-```js
-module.exports = {
-  inputs: {
-    snapshots: [],
-    snapshotsDir: null,
-    timeline: null,
-  },
+现在的策略是：
 
-  business: {
-    classPrefixes: { 'bpx-': 'player', 'bili-': 'bilibili' },
-    classKeyExtractors: [/(bili-[\w-]+)/i, /(bpx-[\w-]+)/i],
-    edgeSemantics: {
-      // mainThumbWrap: '播放器进度条 thumb 容器'
-    },
-  },
+- 不猜业务名；
+- 不依赖 UI 框架规则；
+- 不维护业务映射配置；
+- 只保留 V8 原始对象、对象链、属性边、大小变化、代码栈。
 
-  frameworks: ['vue2', 'vue3', 'react'],
-  customFrameworks: [],
-
-  leakMechanisms: [
-    { match: /IntersectionObserv|ResizeObserv|MutationObserv|PerformanceObserv/, hint: 'observer not disconnected' },
-    { match: /EventTargetData|RegisteredEventListener|EventListenerMap/, hint: 'event listener not removed' },
-  ],
-
-  unboundGrowth: { minSnapshots: 2, thresholdBytes: 1024, maxResults: 50 },
-};
-```
-
-## 通用框架支持
-
-内置 Vue 2、Vue 3、React 的识别规则，都是通过 heap 里的稳定属性边识别，不依赖源码变量名：
-
-- Vue 2：`_isVue`、`$options.name`、`__file` 等。
-- Vue 3：`vnode`、`subTree`、`setupState`、`type.__name` 等。
-- React：Fiber 上的 `memoizedState`、`return`、`child`、`type.displayName` 等。
-
-自研框架不要再新建文件，直接在 `config.js` 里写 inline rule：
-
-```js
-customFrameworks: [{
-  name: 'myfw',
-  detect: (node, H) => H.hasRef(node, '_myFrameworkTag'),
-  nameFrom: (node, H) => H.pickStr(node.getReferenceNode('$options'), ['name', '__file']),
-}],
-```
-
-`H` 提供 `hasRef` / `readStr` / `pickStr`，避免你在配置里直接依赖 memlab 内部对象。
-
-## 用到了 memlab 哪些能力
-
-| memlab 能力 | 本项目用途 |
-|---|---|
-| `getFullHeapFromFile(file)` | 加载 snapshot，构建 heap graph、dominator tree、retainedSize、referrer index |
-| `PluginUtils.filterOutLargestObjects` | 按 retainedSize 取 detached DOM / top holders |
-| `PluginUtils.isNodeWorthInspecting` | 过滤 root、内部节点，减少噪声 |
-| `utils.isDetachedDOMNode` | 判断 detached DOM |
-| `IHeapNode.retainedSize` | 判断跨 snapshot 的保留大小增长 |
-| `IHeapNode.dominatorNode` | 输出主持有链 |
-| `IHeapNode.referrers` / `references` | 输出 retainer 边、全局变量、泄漏机制提示 |
-| `IHeapNode.getReferenceNode(name)` | 通过属性边识别 Vue/React/自研框架 |
-
-## 录制建议
-
-- snapshot：复现前 GC 一次，抓 baseline；重复操作 N 次，GC，再抓 after。趋势分析建议 5+ 份。
-- timeline：DevTools Memory 里选择 **Allocation instrumentation on timeline**，操作时保持录制，这样 `trace_tree` 才能恢复函数级分配栈。
-- SourceMap：如果生产 JS 被压缩，报告只能显示压缩后的函数名、脚本 URL、行列。要回到源码函数，需要后续接入 SourceMap 映射。
+这样对任何前端框架都通用。React、Vue、自研框架、普通 JS 对象都会以同一种形式出现在报告里：真实对象 + 持有链 + 可回源码的栈。
 
 ## 已知限制
 
-- 普通 `.heapsnapshot` 往往没有 `trace_node_id`，无法把“某个 retained object”百分百映射到 timeline 的某个业务函数。此时报告会给对象关系链 + timeline 热点函数候选。
-- 只有两份 snapshot 时，`growth.findings` 是两点差异，不是强趋势。建议用 5 份以上覆盖一次完整业务操作。
-- 生产环境 minify 后，构造器名常是 `t` / `e` / `Object`。业务归属主要靠 DOM class、retainer 边名、框架实例属性和 timeline 脚本位置叠加判断。
+- 普通 `.heapsnapshot` 往往没有 `trace_node_id`，多数对象只能给候选调用栈，不能给精确创建栈。
+- 只有两份 snapshot 时，只能证明 before 到 after 增长；建议使用 4 份以上覆盖一次完整业务操作。
+- 生产代码压缩后，函数名可能不可读，需要 sourcemap 才能从 `scriptUrl:line:column` 回到源码。
+- V8 node id 在同一组 snapshot 中通常可用于追踪，但跨不同录制批次不应混用。
