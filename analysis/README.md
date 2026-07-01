@@ -1,6 +1,6 @@
 # SnapshotMemDetector
 
-SnapshotMemDetector 是一个基于 **memlab** 的 V8 heap snapshot / heaptimeline 静态分析器。当前版本不做业务翻译，不要求维护 `config.js`，只输出最原始、最通用的证据：
+SnapshotMemDetector 是一个基于 **memlab** 的 V8 heap snapshot / heaptimeline 静态分析器。
 
 - 哪些真实 V8 对象持续增长；
 - 这些对象之间如何互相持有；
@@ -259,18 +259,8 @@ scriptUrl:line:column
 - `relationship.retainingPaths`：对象为什么还活着；
 - `stack.frames`：连续调用栈和代码位置。
 
-## 为什么不再需要 config.js
 
-旧版本尝试用 DOM class、框架规则、业务脚本白名单把 V8 对象翻译成业务模块。这个思路在有清晰业务命名时有用，但在生产环境、去符号代码、混淆函数名下会引入误导：报告看起来像业务结论，其实只是启发式猜测。
-
-现在的策略是：
-
-- 不猜业务名；
-- 不依赖 UI 框架规则；
-- 不维护业务映射配置；
-- 只保留 V8 原始对象、对象链、属性边、大小变化、代码栈。
-
-这样对任何前端框架都通用。React、Vue、自研框架、普通 JS 对象都会以同一种形式出现在报告里：真实对象 + 持有链 + 可回源码的栈。
+这样对任何前端框架都通用, React、Vue、自研框架、普通 JS 对象都会以同一种形式出现在报告里：真实对象 + 持有链 + 可回源码的栈。
 
 ## 已知限制
 
