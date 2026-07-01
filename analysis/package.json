@@ -1,0 +1,14 @@
+{
+  "name": "heap-analyzer",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Static V8 heap snapshot/timeline analyzer built on memlab. Adds framework semantics, leak-mechanism hints, and snapshot×timeline correlation on top of memlab's dominator/retainer analysis.",
+  "type": "commonjs",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "analyze": "node --max-old-space-size=12288 analyze.js"
+  },
+  "dependencies": {
+    "@memlab/api": "^1.0.0"
+  }
+}
