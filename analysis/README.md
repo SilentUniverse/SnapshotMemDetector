@@ -2,10 +2,14 @@
 
 SnapshotMemDetector 是一个基于 **memlab** 的 V8 heap snapshot / heaptimeline 静态分析器。
 
-- 哪些真实 V8 对象持续增长；
-- 这些对象之间如何互相持有；
-- 对象为什么还活着，也就是 retainer / dominator 证据；
-- 能回到代码的连续调用栈，优先用对象级 `trace_node_id`，没有时用同次 timeline 的高分配候选栈。
+它的目标不是猜业务模块，而是把浏览器堆里的原始证据整理成可排查的问题：哪些对象持续增长、谁还在持有它们、它们被哪条对象链保留下来，以及哪些代码栈值得回到源码继续查。
+
+最终报告围绕四类信息展开：
+
+- 真实 V8 对象：`object`、`closure`、`native`、`array` 等；
+- 持有关系：`referrers`、retaining path、dominator path；
+- 增长趋势：多份 snapshot 中的 `retainedSize` 变化；
+- 代码位置：对象级 `trace_node_id` 精确栈，或同次 timeline 的高分配候选栈。
 
 ## 目录结构
 
@@ -32,9 +36,9 @@ npm install
 npm run analyze
 ```
 
-默认会读取 `../heapdump/`：
+默认读取 `../heapdump/`：
 
-- `.heapsnapshot` / `.heapdump`：按文件名排序，作为多份 heap 样本。
+- `.heapsnapshot` / `.heapdump`：按文件名排序，作为多份 heap 样本；
 - `.heaptimeline`：默认取目录中最后一份 timeline。
 
 也可以显式指定目录：
@@ -43,7 +47,35 @@ npm run analyze
 node --max-old-space-size=12288 analyze.js --dir D:\Code\Snapshot\heapdump
 ```
 
-建议保留 `--max-old-space-size=12288`。大型 heap 加载和 dominator tree 计算会占用较多内存。
+`--max-old-space-size=12288` 不是算法必须参数，只是给 Node.js 更高内存上限。大型 heap 在加载对象图和计算 dominator tree 时很容易 OOM，所以默认脚本保留这个参数。小文件可以直接运行：
+
+```powershell
+node analyze.js
+```
+
+## 输入建议
+
+至少准备两份 snapshot：
+
+```text
+heapdump/
+  01-before.heapsnapshot
+  02-after.heapsnapshot
+```
+
+更推荐覆盖一次完整操作：
+
+```text
+heapdump/
+  01-before.heapsnapshot
+  02-open-page.heapsnapshot
+  03-run-action.heapsnapshot
+  04-close-page.heapsnapshot
+  05-after-gc.heapsnapshot
+  allocation.heaptimeline
+```
+
+只有两份 snapshot 时，报告只能证明 before 到 after 的增长；样本越多，持续增长判断越可信。
 
 ## 输出
 
@@ -54,7 +86,13 @@ report-<timestamp>-human.md   # 给人看的原始对象报告
 report-<timestamp>-ai.json    # 完整结构化证据
 ```
 
-把 AI JSON 丢给 AI 继续诊断时，直接使用固定提示词：`analysis/AI_PROMPT.md`。这个文件不会在每次运行时重新生成。
+如果要把 AI JSON 丢给 AI 继续诊断，使用固定提示词：
+
+```text
+analysis/AI_PROMPT.md
+```
+
+这个提示词是项目文件，不会在每次运行时重新生成。
 
 命令行也会打印摘要，格式类似：
 
@@ -72,19 +110,45 @@ report-<timestamp>-ai.json    # 完整结构化证据
 代码栈: 候选调用栈，4.82 MB / 239116 次分配
 ```
 
+## 怎么读报告
+
+优先看 `report-<timestamp>-human.md` 里的“需要优先排查的真实对象”。这里展示的是对象簇，不是孤立对象。
+
+一个泄漏通常不是单个对象，而是一串互相持有的对象。例如：
+
+```text
+Context --dn--> closure/e --buf--> Map --table--> Array
+```
+
+这表示闭包上下文持有 `closure/e`，闭包通过 `buf` 字段持有 `Map`，`Map` 又持有底层 `Array`。如果这条链持续增长，真正要查的通常是 `buf`、`Map` 或相关生命周期清理逻辑。
+
+排查顺序建议：
+
+1. 先看增长大小最大的对象簇。
+2. 再看对象链里的容器或生命周期对象，如 `Map`、`Set`、`Array`、`Context`、DOM/native 对象。
+3. 用持有路径确认谁还在引用它。
+4. 用代码栈中的 `scriptUrl:line:column` 回源码或 sourcemap。
+
 ## 整体原理
 
 ```text
-heapdump files
+heap snapshots
   -> memlab heap graph
   -> sustained growth scan
-  -> raw retainer/dominator evidence
+  -> retainer / dominator evidence
   -> related-object clustering
   -> timeline stack attribution
   -> human report + AI JSON
 ```
 
-### 1. memlab 解析 heap
+这个流程里有两个不同的关系图：
+
+- 对象引用图：来自 `.heapsnapshot`，回答“对象为什么还活着”；
+- 函数分配栈：来自 `.heaptimeline`，回答“应该从哪段代码开始查”。
+
+最终结果主要由对象引用图决定。函数分配栈只负责提供源码定位线索，不能单独证明对象为什么没有被 GC。
+
+## 1. memlab 解析出了什么
 
 核心入口是：
 
@@ -92,84 +156,135 @@ heapdump files
 getFullHeapFromFile(file)
 ```
 
-memlab 返回 `IHeapSnapshot`，里面已经包含：
+memlab 会把 V8 heap snapshot 的扁平数组解析成可遍历的 `IHeapSnapshot`。本项目主要使用这些字段：
 
 | memlab 产物 | 含义 | 本项目用途 |
 |---|---|---|
 | `heap.nodes` | V8 heap 全部节点 | 遍历对象，做增长追踪 |
-| `node.id` | V8 节点 id | 多份 snapshot 之间追踪同一个对象 |
-| `node.type` | 节点类型，如 `object`、`closure`、`native` | 过滤可能持有业务状态的节点 |
+| `node.id` | V8 节点 id | 在同一组 snapshot 中追踪同一个对象 |
+| `node.type` | 节点类型，如 `object`、`closure`、`native` | 过滤需要关注的对象类型 |
 | `node.name` | 构造器名、函数名、DOM 描述、V8 内部名 | 展示真实对象身份 |
-| `node.self_size` | 节点自身大小 | 辅助信息 |
-| `node.retainedSize` | 对象独占保留大小 | 判断增长和排序的核心指标 |
-| `node.dominatorNode` | dominator tree 父节点 | 构造主持有链 |
-| `node.references` | 当前节点指向哪些节点 | 后续扩展用 |
+| `node.self_size` | 节点自身大小 | 辅助判断，不作为主要排序依据 |
+| `node.retainedSize` | 对象独占保留大小 | 判断增长和影响范围的核心指标 |
+| `node.references` | 当前节点指向哪些节点 | 表示对象向外引用了什么 |
 | `node.referrers` | 哪些节点指向当前节点 | 找直接持有者和属性边 |
-| `node.trace_node_id` | timeline 分配栈 id | 有值时可映射到对象级精确栈 |
-| `utils.isDetachedDOMNode` | memlab detached DOM 判定 | 输出 DOM 泄漏辅助证据 |
-| `PluginUtils.filterOutLargestObjects` | 按 retainedSize 取 Top N | 找最大 detached DOM / holder |
+| `node.dominatorNode` | dominator tree 父节点 | 找主持有路径 |
+| `node.trace_node_id` | timeline 分配栈 id | 有值时映射到对象级精确栈 |
+| `node.location` | 节点可能携带的源码位置 | 普通 snapshot 中经常为空，只作补充 |
 
-最重要的是 `retainedSize`。它表示“如果释放这个对象，它独占控制的对象图大约能释放多少”，比 `self_size` 更适合判断泄漏影响。
+项目还使用了 memlab 的辅助能力：
 
-### 2. 找持续增长对象
+| 能力 | 用途 |
+|---|---|
+| `utils.isDetachedDOMNode` | 判断 detached DOM 相关对象 |
+| `PluginUtils.filterOutLargestObjects` | 从 heap 中按 retained size 找大对象 |
+| `PluginUtils.isNodeWorthInspecting` | 找值得人工检查的大 holder |
 
-工具按 V8 node id 追踪对象，只保留：
+最重要的是 `retainedSize`。它表示“如果释放这个对象，它独占控制的对象图大约能释放多少”。泄漏对象本身可能很小，但它可能通过引用链保留一个很大的对象子图。
+
+## 2. 怎么通过对象关系找到结果
+
+项目不是先看函数调用，而是先找持续增长的对象。
+
+它按 `node.id` 在多份 snapshot 中追踪对象，只保留：
 
 - 在每份 snapshot 中都存在；
 - `type` 和 `name` 没变；
 - `retainedSize` 单调不下降；
 - 增长量超过阈值，默认 `1024 B`。
 
-被追踪的类型：
+当前追踪的类型是：
 
-```js
+```text
 object, closure, regexp, native, array
 ```
 
-这些类型最容易代表 JS 状态、闭包上下文、DOM/native 对象和容器结构。
+找到增长对象后，项目会在最后一份 snapshot 中提取三类持有证据：
 
-### 3. 合并相关对象
+| 证据 | 回答的问题 |
+|---|---|
+| `referrers` | 谁直接引用了这个对象？引用边叫什么？ |
+| `retainingPaths` | 从这个对象向外走，能看到哪些可读持有路径？ |
+| `dominatorPath` | 哪些对象在 dominator tree 上主导保留它？ |
 
-单个泄漏通常不是一个对象，而是一串对象链。例如：
+然后项目用 Union-Find 合并相关对象。只要两个增长对象之间存在直接 referrer 边、出现在同一条 retaining path、或出现在同一条 dominator path 中，就把它们合成一个对象簇。
 
-```text
-system / Context / scope @1750315 --dn--> closure/e --buf--> Map --table--> Array
-```
+这样做的原因是：真实泄漏通常是一串对象链，而不是单点对象。人类报告优先展示对象簇，可以减少重复信息，让排查目标更接近“该清理哪条引用链”。
 
-这说明：
+## 3. memlab 本身怎么寻找
 
-- 一个闭包上下文保留了 `closure/e`；
-- `closure/e` 通过 `buf` 属性持有 `Map`；
-- `Map` 通过 `table` 持有底层数组；
-- 这几个对象一起增长，应该作为一个排查点看。
+memlab 本身并不直接判断业务泄漏。它做的是底层 heap graph 建模。
 
-工具会用增长对象之间的直接 referrer 边、retaining path、dominator path 做 union，把互相持有或相邻的增长对象合并成“对象簇”。人类报告优先展示对象簇，而不是展示一堆重复对象。
-
-### 4. 提取持有证据
-
-每个增长对象会记录：
-
-- `dominatorPath`：主持有路径，回答“谁主导保留它”；
-- `referrers`：直接引用它的对象和属性边；
-- `retainingPaths`：从对象向外走 referrer 得到的可读持有路径；
-- `exactStack`：如果对象有 `trace_node_id`，映射到 timeline 中的精确对象栈。
-
-报告里的“持有路径”来自 `referrers`，例如：
+V8 heap snapshot 原始数据接近这种结构：
 
 ```text
-previous <- object/system / Context / scope @1785313 <- context <- closure/(anonymous)
+nodes array
+edges array
+strings table
+snapshot metadata
+trace metadata
 ```
 
-这比业务翻译更底层，也更通用：即使代码去符号，属性边和 V8 对象关系仍然可用。
+memlab 会把这些扁平数组还原成对象图：
 
-### 5. 映射到代码栈
+```text
+raw snapshot arrays
+  -> IHeapNode
+  -> node.references
+  -> node.referrers
+  -> dominator tree
+  -> retainedSize
+```
 
-`.heaptimeline` 里有两类关键数据：
+引用图回答的是：
 
-- `trace_function_infos`：函数名、脚本 URL、行、列；
-- `trace_tree`：递归 allocation 调用树，每个节点有 `count` 和 `size`。
+- A 是否直接引用 B；
+- A 通过哪个属性或边引用 B；
+- 谁还在引用 B。
 
-工具会把 `trace_tree` 展成连续调用栈：
+Dominator tree 回答的是：
+
+- 如果释放 A，哪些对象只能跟着 A 一起释放；
+- A 是否主导保留某批对象；
+- A 的 `retainedSize` 大概有多大。
+
+可以把 dominator 理解成“所有通往某对象的路径都必须经过的节点”。例如：
+
+```text
+GC Root
+  -> Window
+    -> App
+      -> Cache
+        -> BigArray
+```
+
+如果从 GC Root 到 `BigArray` 的所有路径都必须经过 `Cache`，那么 `Cache` dominate `BigArray`。释放 `Cache` 时，`BigArray` 也会变得可释放，所以 `Cache.retainedSize` 会体现这部分影响。
+
+因此 memlab 提供的是对象图、反向引用、dominator 和 retained size。本项目再基于这些底层证据做跨 snapshot 增长判断和对象簇归并。
+
+## 4. 函数关系的具体原理
+
+函数关系来自 `.heaptimeline`，不是 `.heapsnapshot`。
+
+`.heaptimeline` 里有两块关键数据：
+
+| 数据 | 含义 |
+|---|---|
+| `trace_function_infos` | 函数表，包含函数名、脚本 URL、行、列 |
+| `trace_tree` | 分配调用树，包含 trace node id、函数索引、分配次数、分配大小和子节点 |
+
+项目会先把 `trace_function_infos` 解析成函数帧：
+
+```js
+{
+  functionName,
+  scriptUrl,
+  line,
+  column,
+}
+```
+
+然后递归遍历 `trace_tree`。每走到一个节点，就把当前函数帧追加到调用栈里，形成连续的 allocation stack：
 
 ```text
 run (...index.js:13:1473)
@@ -179,12 +294,23 @@ run (...index.js:13:1473)
         -> value (...index.js:30:110855)
 ```
 
-栈分两种置信度：
+同时项目会统计：
 
-- **精确对象栈**：heap node 有 `trace_node_id`，并且能在 timeline 的 `trace_tree` 里找到；
-- **候选调用栈**：普通 snapshot 没有对象级 `trace_node_id`，只能展示同次 timeline 中分配最多的连续栈，作为回源码的候选位置。
+- 每个函数下累计分配了多少字节；
+- 每个函数下发生了多少次分配；
+- 每个脚本文件的累计分配量；
+- 每个 trace node 对应的连续调用栈。
 
-如果代码被压缩或去符号，函数名可能只是 `t`、`e`、`value`。此时最可靠的定位锚点是：
+报告里的栈有两种置信度：
+
+| 栈类型 | 含义 | 可信度 |
+|---|---|---|
+| 精确对象栈 | heap node 有 `trace_node_id`，且能在 `trace_tree` 中找到 | 高 |
+| 候选调用栈 | snapshot 没有对象级 `trace_node_id`，展示同次 timeline 中分配最多的连续栈 | 中 |
+
+关键区别是：对象引用图证明“为什么活着”，函数分配栈说明“可能从哪里创建”。如果只有候选调用栈，它只能提示优先排查位置，不能单独证明某个对象一定由这条栈创建。
+
+如果生产代码被压缩或去符号，函数名可能只是 `t`、`e`、`value`。此时最可靠的定位锚点是：
 
 ```text
 scriptUrl:line:column
@@ -259,12 +385,9 @@ scriptUrl:line:column
 - `relationship.retainingPaths`：对象为什么还活着；
 - `stack.frames`：连续调用栈和代码位置。
 
-
-这样对任何前端框架都通用, React、Vue、自研框架、普通 JS 对象都会以同一种形式出现在报告里：真实对象 + 持有链 + 可回源码的栈。
-
 ## 已知限制
 
 - 普通 `.heapsnapshot` 往往没有 `trace_node_id`，多数对象只能给候选调用栈，不能给精确创建栈。
-- 只有两份 snapshot 时，只能证明 before 到 after 增长；建议使用 4 份以上覆盖一次完整业务操作。
+- 只有两份 snapshot 时，只能证明 before 到 after 增长；建议使用 4 份以上覆盖一次完整操作。
 - 生产代码压缩后，函数名可能不可读，需要 sourcemap 才能从 `scriptUrl:line:column` 回到源码。
 - V8 node id 在同一组 snapshot 中通常可用于追踪，但跨不同录制批次不应混用。
